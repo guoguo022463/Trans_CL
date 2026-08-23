@@ -1,5 +1,28 @@
--e git+https://github.com/koukipp/nfstream.git@5c06468c2f85b4844e9b5528984fbc9e727d2343#egg=nfstream
-numpy==1.26.4
-pandas==2.3.1
-scikit-learn==1.7.2
-torch==2.7.1
+# Trans-CL v4 依赖清单
+# 更新时间: 2026-08-20
+# 说明: 覆盖 train_transcl_v4.py + predict_transcl_v4.py 全部依赖
+
+# ============= 核心依赖 =============
+
+# PyTorch (训练+推理)
+# Windows CUDA 安装命令:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0
+
+# 数值计算
+numpy>=1.24.0
+
+# 数据处理 (读取 parquet/csv)
+pandas>=2.0.0
+pyarrow>=12.0.0          # pandas 读取 .parquet 必需
+
+# 机器学习工具 (TF-IDF, PCA, 评估指标, 数据划分)
+scikit-learn>=1.3.0
+
+# ============= 可选依赖 =============
+
+# W&B 实验跟踪 (离线模式可不装)
+wandb>=0.16.0
+
+# ============= Python 标准库 (无需安装) =============
+# os, argparse, warnings, re, ipaddress, pickle, datetime, collections

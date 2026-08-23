@@ -1,0 +1,14 @@
+# Normalize text line endings to LF in the repository (cross-platform friendly)
+* text=auto eol=lf
+
+# Binary formats — do not diff/converse
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.docx binary
+*.pdf binary
+*.pkl binary
+*.pth binary
+*.pt binary
+*.parquet binary

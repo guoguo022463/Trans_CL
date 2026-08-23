@@ -1,0 +1,38 @@
+# ============ Data (raw + processed, too large for version control) ============
+data/
+*.parquet
+*.pq
+
+# ============ Model checkpoints / learned weights ============
+models/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.onnx
+
+# ============ Prediction / result outputs ============
+res.csv
+*.csv
+
+# ============ Experiment tracking / logs ============
+wandb/
+*.log
+
+# ============ Python caches & virtualenvs ============
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ============ IDE / OS files ============
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+# main/ 数据工作区（仅数据与产物）
+main/

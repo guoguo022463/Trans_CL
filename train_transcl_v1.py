@@ -547,6 +547,7 @@ def train_supervised(model, train_loader, valid_loader, criterion, device, epoch
     opt = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
                            lr=lr, weight_decay=weight_decay)
     best_f1, best_ep = 0.0, 0
+    best_res = None
     no_improve = 0
     for ep in range(1, epochs+1):
         model.train(); tot, corr, total = 0.0, 0, 0
@@ -563,12 +564,17 @@ def train_supervised(model, train_loader, valid_loader, criterion, device, epoch
         if ep % eval_every == 0 or ep == epochs:
             res = evaluate_model(model, valid_loader, device, 'validation', run, ep)
             val_f1 = res['Weighted']['F1']
+            save_metrics_row(os.path.join(save_dir, 'metrics.csv'), ep,
+                             tot/len(train_loader), acc, res)
             if val_f1 > best_f1:
                 best_f1, best_ep = val_f1, ep
+                best_res = res
                 no_improve = 0
                 p = os.path.join(save_dir, 'best.pth')
                 torch.save({'epoch': ep, 'model': model.cpu().state_dict(), 'val_f1': best_f1}, p)
                 model.to(device)
+                save_confusion_matrix(res['cm'], os.path.join(save_dir, 'cm_best.png'),
+                                      f'Confusion Matrix (Epoch {ep})')
                 print(f'  [BEST] Saved (Weighted F1={best_f1:.4f})')
             else:
                 no_improve += 1
@@ -577,7 +583,7 @@ def train_supervised(model, train_loader, valid_loader, criterion, device, epoch
                     print(f'  [EARLY STOP] No improvement for {patience} epochs. Best: Ep {best_ep}')
                     break
     print(f'\nPhase 2 done. Best Val F1: {best_f1:.4f} (Epoch {best_ep})')
-    return best_f1, best_ep
+    return best_f1, best_ep, best_res
 
 def evaluate_model(model, loader, device, prefix='val', run=None, step=None):
     model.eval(); preds, labels, probs = [], [], []
@@ -593,6 +599,58 @@ def evaluate_model(model, loader, device, prefix='val', run=None, step=None):
     if run:
         wandb_log_all(run, labels, preds, res, prefix, step=step)
     return res
+
+
+def save_metrics_row(csv_path, epoch, train_loss, train_acc, res):
+    """追加一行训练/验证指标到 CSV（首次写入表头）"""
+    import csv as _csv
+    header = ['epoch', 'train_loss', 'train_acc', 'val_acc', 'val_auc',
+              'macro_tpr', 'macro_fpr', 'macro_tnr', 'macro_fnr',
+              'macro_pre', 'macro_sen', 'macro_f1', 'weighted_f1',
+              'benign_f1', 'suspicious_f1', 'malicious_f1']
+    auc = res['AUC'] if res['AUC'] is not None else float('nan')
+    row = [epoch, train_loss, train_acc, res['ACC'], auc,
+           res['Macro']['TPR'], res['Macro']['FPR'], res['Macro']['TNR'], res['Macro']['FNR'],
+           res['Macro']['PRE'], res['Macro']['SEN'], res['Macro']['F1'],
+           res['Weighted']['F1'],
+           res['per']['c0']['F1'], res['per']['c1']['F1'], res['per']['c2']['F1']]
+    new_file = not os.path.exists(csv_path)
+    with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+        w = _csv.writer(f)
+        if new_file:
+            w.writerow(header)
+        w.writerow(row)
+
+
+def save_confusion_matrix(cm, path, title='Confusion Matrix'):
+    """保存混淆矩阵图（PNG）"""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    names = ['Benign', 'Suspicious', 'Malicious']
+    cm = np.array(cm, dtype=int)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm, cmap='Blues')
+    ax.set_xticks(range(3)); ax.set_yticks(range(3))
+    ax.set_xticklabels(names); ax.set_yticklabels(names)
+    ax.set_xlabel('Predicted'); ax.set_ylabel('True'); ax.set_title(title)
+    thresh = cm.max() / 2 if cm.max() > 0 else 0.5
+    for i in range(3):
+        for j in range(3):
+            ax.text(j, i, str(cm[i, j]), ha='center', va='center',
+                    color='white' if cm[i, j] > thresh else 'black')
+    fig.colorbar(im)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def save_run_report(path, report):
+    """保存训练报告 JSON"""
+    import json as _json
+    with open(path, 'w', encoding='utf-8') as f:
+        _json.dump(report, f, ensure_ascii=False, indent=2)
+
 
 # ============================================================
 # 6. main
@@ -681,10 +739,10 @@ def main():
     alpha = torch.tensor(w, dtype=torch.float32).to(device)
     criterion = FocalLoss(alpha=alpha, gamma=args.focal_gamma)
     print(f'  FocalLoss alpha={alpha.cpu().numpy()}, gamma={args.focal_gamma}')
-    best_f1, best_ep = train_supervised(model, tr_ld, va_ld, criterion, device,
-                                         args.supervised_epochs, args.supervised_lr,
-                                         args.weight_decay, args.patience,
-                                         run, args.eval_every, args.save_dir)
+    best_f1, best_ep, best_res = train_supervised(model, tr_ld, va_ld, criterion, device,
+                                                  args.supervised_epochs, args.supervised_lr,
+                                                  args.weight_decay, args.patience,
+                                                  run, args.eval_every, args.save_dir)
 
     # 7. Final Save
     print(); print('[4/4] Saving final model...')
@@ -703,6 +761,24 @@ def main():
     print(); print('='*70)
     print('Training Complete!')
     print(f'  Best Val Weighted F1: {best_f1:.4f} (Epoch {best_ep})')
+
+    # 8. 保存训练报告
+    report = {
+        'save_dir': args.save_dir,
+        'best_epoch': best_ep,
+        'best_val_weighted_f1': best_f1,
+        'data': {
+            'train': args.data_path,
+            'val': args.val_path,
+            'val_answer': args.val_answer,
+        },
+        'config': vars(args),
+        'best_metrics': best_res if best_res is not None else None,
+        'files': ['final.pth', 'encoder.pkl', 'best.pth', 'contrastive.pth',
+                  'metrics.csv', 'cm_best.png'],
+    }
+    save_run_report(os.path.join(args.save_dir, 'run_report.json'), report)
+    print(f'  Saved report: {os.path.join(args.save_dir, "run_report.json")}')
     print('='*70)
 
 if __name__ == '__main__':

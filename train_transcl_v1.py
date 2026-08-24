@@ -359,7 +359,6 @@ class SOCFeatureEncoder:
     def _ensure_text(self, df):
         if '_text' in df.columns:
             return df
-        df = df.copy()
         if 'message_sanitized' in df.columns:
             df['_text'] = df['message_sanitized'].fillna('').astype(str)
         elif 'product_name' in df.columns and 'vendor_name' in df.columns:

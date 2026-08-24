@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Trans-CL v4 - SHAP 特征重要性分析与可视化 (修复版)
+Trans-CL v1 - SHAP 特征重要性分析与可视化 (修复版)
 修复:
   1. 自动设置 _text 列（transform 必需）
   2. title 改用 plt.title()（shap.summary_plot 的 title 参数无效）
@@ -48,7 +48,7 @@ def prepare_text_column(df):
 
 
 def main():
-    p = argparse.ArgumentParser(description='Trans-CL v4 SHAP Analysis')
+    p = argparse.ArgumentParser(description='Trans-CL v1 SHAP Analysis')
     p.add_argument('--data-path', required=True)
     p.add_argument('--model-path', required=True)
     p.add_argument('--encoder-path', required=True)
@@ -79,7 +79,7 @@ def main():
     class CustomUnpickler(pickle.Unpickler):
         def find_class(self, module, name):
             if module == '__main__':
-                module = 'train_transcl_v4'
+                module = 'train_transcl_v1'
             return super().find_class(module, name)
 
     with open(args.encoder_path, 'rb') as f:
@@ -87,7 +87,7 @@ def main():
 
     # 3. 加载模型
     print('[3/5] Loading model...')
-    from train_transcl_v4 import TransCLContrastiveModel
+    from train_transcl_v1 import TransCLContrastiveModel
     model = TransCLContrastiveModel(device=device, num_classes=3)
     ckpt = torch.load(args.model_path, map_location=device)
     model.load_state_dict(ckpt['model'])

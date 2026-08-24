@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Trans-CL v4 — 三分类 (benign/suspicious/malicious) + 对比学习 + W&B
+Trans-CL v1 — 三分类 (benign/suspicious/malicious) + 对比学习 + W&B
 完全自包含版本: 不依赖 model.py / transcl_classifier.py
 修复: OutputLayer 512维, encode用column_embeddings, 无split, chunk OOM
 """
@@ -130,48 +130,62 @@ class FocalLoss(nn.Module):
         return loss
 
 # ============================================================
-# 1. 数据加载 (100%/100% 无split)
+# 1. 数据加载 (训练集 + 独立验证集)
 # ============================================================
 
-def load_data_nosplit(data_path, random_state=42):
-    """加载全部数据，不采样，train和valid均为全部数据（100% / 100%）"""
-    print(f'[1/4] Loading data: {data_path}')
-    if data_path.endswith(('.parquet', '.pq')):
-        df = pd.read_parquet(data_path)
-    else:
-        df = pd.read_csv(data_path, low_memory=False)
+def _read_table(path):
+    """读取 parquet/csv 表格"""
+    if str(path).endswith(('.parquet', '.pq')):
+        return pd.read_parquet(path)
+    return pd.read_csv(path, low_memory=False)
 
-    N = len(df)
-    print(f'  Total: {N:,} samples (FULL DATA — no split, 100% train + 100% valid)')
 
+def _attach_label(df):
+    """把 label_binary/label 列映射成 0/1/2 的 label 列"""
     label_col = 'label_binary' if 'label_binary' in df.columns else 'label'
     assert label_col in df.columns, f'Data must have "label_binary" or "label" column. Got: {df.columns.tolist()}'
-
     label_map = {'benign': 0, 'suspicious': 1, 'malicious': 2}
     if df[label_col].dtype == object or str(df[label_col].dtype).startswith('str'):
-        unique_vals = df[label_col].unique()
-        for v in unique_vals:
+        for v in df[label_col].unique():
             if v not in label_map:
                 print(f'  [WARNING] Unknown label "{v}", mapping to 0 (benign)')
                 label_map[v] = 0
         df['label'] = df[label_col].map(label_map).astype(np.int64)
     else:
         df['label'] = df[label_col].astype(np.int64)
+    return df
 
-    for idx, name in [(0, 'Benign'), (1, 'Suspicious'), (2, 'Malicious')]:
-        c = (df['label'] == idx).sum()
-        print(f'  {name:12s}: {c:>10,} ({c/N*100:>5.1f}%)')
 
-    train_df = df.copy().reset_index(drop=True)
-    valid_df = df.copy().reset_index(drop=True)
+def load_train_valid(data_path, val_path=None, val_answer=None):
+    """加载训练集与验证集。
+    - 训练集: data_path（含标签）
+    - 验证集: val_path（输入，无标签）+ val_answer（标签，按 event_id 对齐）
+    若不提供 val_path/val_answer，则退化为 100%/100%（train=valid 同一份，向后兼容）。
+    """
+    print(f'[1/4] Loading training data: {data_path}')
+    train_df = _attach_label(_read_table(data_path))
 
-    print(f'\n  ====== Dataset Split (100% / 100% — No Sampling) ======')
+    if val_path and val_answer:
+        print(f'  Loading validation input: {val_path}')
+        valid_df = _read_table(val_path)
+        print(f'  Loading validation answer: {val_answer}')
+        ans = _read_table(val_answer)
+        if 'event_id' in valid_df.columns and 'event_id' in ans.columns:
+            valid_df = valid_df.merge(ans[['event_id', 'label_binary']], on='event_id', how='left')
+        else:
+            valid_df['label_binary'] = ans['label_binary'].values
+        valid_df = _attach_label(valid_df)
+    else:
+        print('  (未提供 --val-path/--val-answer，退化为 100%/100%：train=valid 同一份)')
+        valid_df = train_df.copy().reset_index(drop=True)
+
+    print('\n  ====== Dataset Split ======')
     for name, d in [('Train', train_df), ('Valid', valid_df)]:
         n = len(d)
-        print(f'  {name:6s}: {n:>10,} (100.0%)')
+        print(f'  {name:6s}: {n:>10,}')
         for idx, name2 in [(0, 'Benign'), (1, 'Suspicious'), (2, 'Malicious')]:
-            c = (d['label'] == idx).sum()
-            print(f'    {name2:12s}: {c:>8,}')
+            c = int((d['label'] == idx).sum())
+            print(f'    {name2:12s}: {c:>8,}  ({c/n*100:>5.1f}%)')
     print()
     return train_df, valid_df
 
@@ -322,6 +336,7 @@ class SOCFeatureEncoder:
         return self.pca.transform(v.toarray())[0].tolist()
 
     def transform(self, df):
+        df = self._ensure_text(df)
         feats = []
         for _, row in df.iterrows():
             t = self._time(row.get('timestamp',0))
@@ -341,7 +356,10 @@ class SOCFeatureEncoder:
             feats.append(f)
         return np.array(feats, dtype=np.float32)
 
-    def fit_transform(self, df):
+    def _ensure_text(self, df):
+        if '_text' in df.columns:
+            return df
+        df = df.copy()
         if 'message_sanitized' in df.columns:
             df['_text'] = df['message_sanitized'].fillna('').astype(str)
         elif 'product_name' in df.columns and 'vendor_name' in df.columns:
@@ -350,6 +368,10 @@ class SOCFeatureEncoder:
             df['_text'] = df['product_name'].fillna('').astype(str)
         else:
             df['_text'] = ''
+        return df
+
+    def fit_transform(self, df):
+        df = self._ensure_text(df)
         self.fit(df)
         return self.transform(df)
 
@@ -517,7 +539,7 @@ def train_contrastive(model, train_loader, device, epochs, lr, run=None):
         if run: run.log({'contrastive/loss': avg, 'contrastive/epoch': ep}, step=ep)
 
 def train_supervised(model, train_loader, valid_loader, criterion, device, epochs, lr,
-                     weight_decay=1e-5, patience=6, run=None, eval_every=1, save_dir='models/transcl_v4'):
+                     weight_decay=1e-5, patience=6, run=None, eval_every=1, save_dir='models/transcl_v1'):
     print(); print('='*60); print('PHASE 2: Supervised Classification (3-class)'); print('='*60)
     os.makedirs(save_dir, exist_ok=True)
     for p in model.parameters(): p.requires_grad = False
@@ -578,8 +600,10 @@ def evaluate_model(model, loader, device, prefix='val', run=None, step=None):
 # ============================================================
 
 def main():
-    p = argparse.ArgumentParser(description='Trans-CL v4 — 3-class + Contrastive + W&B (Self-contained)')
-    p.add_argument('--data-path', required=True)
+    p = argparse.ArgumentParser(description='Trans-CL v1 — 3-class + Contrastive + W&B (Self-contained)')
+    p.add_argument('--data-path', required=True, help='训练集 parquet/csv（含 label_binary）')
+    p.add_argument('--val-path', default=None, help='验证输入 parquet/csv（无标签，需配合 --val-answer）')
+    p.add_argument('--val-answer', default=None, help='验证标签 parquet/csv（event_id + label_binary）')
     p.add_argument('--batch-size', type=int, default=256)
     p.add_argument('--hidden-dim', type=int, default=256)
     p.add_argument('--num-layers', type=int, default=4)
@@ -601,7 +625,7 @@ def main():
     p.add_argument('--wandb-offline', action='store_true')
     p.add_argument('--wandb-disabled', action='store_true')
     p.add_argument('--eval-every', type=int, default=1)
-    p.add_argument('--save-dir', default='models/transcl_v4')
+    p.add_argument('--save-dir', default='models/transcl_v1')
     p.add_argument('--seed', type=int, default=42)
     args = p.parse_args()
 
@@ -615,12 +639,14 @@ def main():
         tags = [t.strip() for t in args.wandb_tags.split(',') if t.strip()]
         tags.extend(['contrastive', 'parquet', '3class', '32d'])
         run = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
-                         name=args.wandb_run_name or f'v4_3class_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
+                         name=args.wandb_run_name or f'v1_3class_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
                          tags=tags, mode=mode, config=vars(args))
         print(f'[W&B] {run.url}')
 
-    # 1. Load data (100%/100% no split)
-    train_df, valid_df = load_data_nosplit(args.data_path, args.seed)
+    # 1. Load data (训练集 + 独立验证集)
+    if bool(args.val_path) != bool(args.val_answer):
+        p.error('--val-path 与 --val-answer 需同时提供')
+    train_df, valid_df = load_train_valid(args.data_path, args.val_path, args.val_answer)
 
     # 2. Feature Encoding
     encoder = SOCFeatureEncoder()

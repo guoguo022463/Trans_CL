@@ -17,6 +17,7 @@ res.csv
 
 # ============ Experiment tracking / logs ============
 wandb/
+runs/
 *.log
 
 # ============ Python caches & virtualenvs ============

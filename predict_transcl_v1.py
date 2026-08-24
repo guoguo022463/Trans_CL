@@ -4,7 +4,7 @@
 Trans-CL v1 推理脚本 (三分类) — 预测输出符合赛题格式
 ======================================================
 用法:
-  python predict_transcl_v1.py --data-path valid_input.parquet --model-path models/transcl_v4/final.pth --encoder-path models/transcl_v4/encoder.pkl --output-path res.csv
+  python predict_transcl_v1.py --data-path valid_input.parquet --model-path models/transcl_v1/final.pth --encoder-path models/transcl_v1/encoder.pkl --output-path res.csv
 """
 import torch, torch.nn.functional as F
 import argparse, warnings, numpy as np, pandas as pd, pickle
@@ -38,18 +38,18 @@ def main():
     print(f'Loaded {len(df):,} samples')
 
     # 用自定义 Unpickler 解决 __main__ 模块路径问题
-    # encoder.pkl 是在 train_transcl_v4.py（__main__）中保存的，predict 脚本中 __main__ 不同
+    # encoder.pkl 是在 train_transcl_v1.py（__main__）中保存的，predict 脚本中 __main__ 不同
     class CustomUnpickler(pickle.Unpickler):
         def find_class(self, module, name):
             if module == '__main__':
-                module = 'train_transcl_v4'
+                module = 'train_transcl_v1'
             return super().find_class(module, name)
 
     with open(args.encoder_path, 'rb') as f:
         encoder = CustomUnpickler(f).load()
     print(f'Encoder: {encoder.NUM_FEATURES}D')
 
-    from train_transcl_v4 import TransCLContrastiveModel, evaluate_metrics, print_metrics
+    from train_transcl_v1 import TransCLContrastiveModel, evaluate_metrics, print_metrics
     model = TransCLContrastiveModel(device=device, num_classes=3)
     ckpt = torch.load(args.model_path, map_location=device)
     model.load_state_dict(ckpt['model'])

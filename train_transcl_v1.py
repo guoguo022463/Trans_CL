@@ -652,6 +652,21 @@ def save_run_report(path, report):
         _json.dump(report, f, ensure_ascii=False, indent=2)
 
 
+def auto_run_name(save_base):
+    """生成 MMDD_XX 格式的实验名（当天第 XX 次）"""
+    mdd = datetime.now().strftime('%m%d')
+    count = 0
+    if os.path.isdir(save_base):
+        for name in os.listdir(save_base):
+            if name.startswith(mdd + '_'):
+                try:
+                    n = int(name.rsplit('_', 1)[-1])
+                    count = max(count, n)
+                except ValueError:
+                    pass
+    return f'{mdd}_{count+1:02d}'
+
+
 # ============================================================
 # 6. main
 # ============================================================
@@ -680,6 +695,8 @@ def main():
     p.add_argument('--wandb-project', default='transcl-soc')
     p.add_argument('--wandb-entity', default=None)
     p.add_argument('--wandb-run-name', default=None)
+    p.add_argument('--run-name', default=None,
+                   help='实验名，默认自动生成 MMDD_XX（日期+当天次数）')
     p.add_argument('--wandb-tags', default='')
     p.add_argument('--wandb-offline', action='store_true')
     p.add_argument('--wandb-disabled', action='store_true')
@@ -688,9 +705,13 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     args = p.parse_args()
 
+    # 实验命名：默认 日期+次数（MMDD_XX），并作为 save_dir 子目录
+    run_name = args.run_name or auto_run_name(args.save_dir)
+    args.save_dir = os.path.join(args.save_dir, run_name)
+
     mode = 'disabled' if args.wandb_disabled else ('offline' if args.wandb_offline else 'online')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Device: {device} | W&B mode: {mode}')
+    print(f'Device: {device} | W&B mode: {mode} | Run: {run_name}')
     torch.manual_seed(args.seed); np.random.seed(args.seed)
 
     run = None
@@ -698,7 +719,7 @@ def main():
         tags = [t.strip() for t in args.wandb_tags.split(',') if t.strip()]
         tags.extend(['contrastive', 'parquet', '3class', '32d'])
         run = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
-                         name=args.wandb_run_name or f'v1_3class_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
+                         name=args.wandb_run_name or run_name,
                          tags=tags, mode=mode, config=vars(args))
         print(f'[W&B] {run.url}')
 
@@ -772,6 +793,7 @@ def main():
 
     # 8. 保存训练报告
     report = {
+        'run_name': run_name,
         'save_dir': args.save_dir,
         'best_epoch': best_ep,
         'best_val_weighted_f1': best_f1,

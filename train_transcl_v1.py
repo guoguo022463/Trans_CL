@@ -156,11 +156,13 @@ def _attach_label(df):
     return df
 
 
-def load_train_valid(data_path, val_path=None, val_answer=None):
+def load_train_valid(data_path, val_path=None, val_answer=None, split=0.15, seed=42):
     """加载训练集与验证集。
     - 训练集: data_path（含标签）
-    - 验证集: val_path（输入，无标签）+ val_answer（标签，按 event_id 对齐）
-    若不提供 val_path/val_answer，则退化为 100%/100%（train=valid 同一份，向后兼容）。
+    - 验证集优先级:
+      1) val_path + val_answer（外部验证，按 event_id 对齐）
+      2) split（从训练集内部分层切出 split 比例做验证，默认 0.15 即 85/15）
+      3) split=0（100%/100%，train=valid 同一份，向后兼容）
     """
     print(f'[1/4] Loading training data: {data_path}')
     train_df = _attach_label(_read_table(data_path))
@@ -175,8 +177,12 @@ def load_train_valid(data_path, val_path=None, val_answer=None):
         else:
             valid_df['label_binary'] = ans['label_binary'].values
         valid_df = _attach_label(valid_df)
+    elif split and 0 < split < 1:
+        print(f'  内部划分: {split*100:.0f}% 验证 / {(1-split)*100:.0f}% 训练（分层）')
+        train_df, valid_df = train_test_split(
+            train_df, test_size=split, random_state=seed, stratify=train_df['label'])
     else:
-        print('  (未提供 --val-path/--val-answer，退化为 100%/100%：train=valid 同一份)')
+        print('  (100%/100%：train=valid 同一份，不划分)')
         valid_df = train_df.copy().reset_index(drop=True)
 
     print('\n  ====== Dataset Split ======')
@@ -676,6 +682,8 @@ def main():
     p.add_argument('--data-path', required=True, help='训练集 parquet/csv（含 label_binary）')
     p.add_argument('--val-path', default=None, help='验证输入 parquet/csv（无标签，需配合 --val-answer）')
     p.add_argument('--val-answer', default=None, help='验证标签 parquet/csv（event_id + label_binary）')
+    p.add_argument('--split', type=float, default=0.15,
+                   help='从训练集内部分层切出的验证比例(0~1)，默认 0.15(85/15)；0 则不划分；传 --val-path/--val-answer 时外部验证优先')
     p.add_argument('--batch-size', type=int, default=256)
     p.add_argument('--hidden-dim', type=int, default=256)
     p.add_argument('--num-layers', type=int, default=4)
@@ -726,7 +734,8 @@ def main():
     # 1. Load data (训练集 + 独立验证集)
     if bool(args.val_path) != bool(args.val_answer):
         p.error('--val-path 与 --val-answer 需同时提供')
-    train_df, valid_df = load_train_valid(args.data_path, args.val_path, args.val_answer)
+    train_df, valid_df = load_train_valid(args.data_path, args.val_path, args.val_answer,
+                                          args.split, args.seed)
 
     # 2. Feature Encoding
     encoder = SOCFeatureEncoder()

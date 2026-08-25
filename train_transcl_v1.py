@@ -544,7 +544,8 @@ def train_contrastive(model, train_loader, device, epochs, lr, run=None):
         if run: run.log({'contrastive/loss': avg, 'contrastive/epoch': ep}, step=ep)
 
 def train_supervised(model, train_loader, valid_loader, criterion, device, epochs, lr,
-                     weight_decay=1e-5, patience=6, run=None, eval_every=1, save_dir='models/transcl_v1'):
+                     weight_decay=1e-5, patience=6, run=None, eval_every=1, save_dir='models/transcl_v1',
+                     step_offset=0):
     print(); print('='*60); print('PHASE 2: Supervised Classification (3-class)'); print('='*60)
     os.makedirs(save_dir, exist_ok=True)
     for p in model.parameters(): p.requires_grad = False
@@ -566,9 +567,9 @@ def train_supervised(model, train_loader, valid_loader, criterion, device, epoch
             corr += (logits.argmax(1) == y).sum().item(); total += len(y)
         acc = corr / total
         print(f'  Supervised Ep {ep}/{epochs} | Loss={tot/len(train_loader):.4f} Acc={acc:.4f}')
-        if run: run.log({'supervised/train_loss': tot/len(train_loader), 'supervised/train_acc': acc}, step=ep)
+        if run: run.log({'supervised/train_loss': tot/len(train_loader), 'supervised/train_acc': acc}, step=step_offset+ep)
         if ep % eval_every == 0 or ep == epochs:
-            res = evaluate_model(model, valid_loader, device, 'validation', run, ep)
+            res = evaluate_model(model, valid_loader, device, 'validation', run, step_offset+ep)
             val_f1 = res['Weighted']['F1']
             save_metrics_row(os.path.join(save_dir, 'metrics.csv'), ep,
                              tot/len(train_loader), acc, res)
@@ -780,15 +781,17 @@ def main():
     best_f1, best_ep, best_res = train_supervised(model, tr_ld, va_ld, criterion, device,
                                                   args.supervised_epochs, args.supervised_lr,
                                                   args.weight_decay, args.patience,
-                                                  run, args.eval_every, args.save_dir)
+                                                  run, args.eval_every, args.save_dir,
+                                                  step_offset=args.contrastive_epochs)
 
     # 7. Final Save
-    print(); print('[4/4] Saving final model...')
+    print(); print('[4/4] Saving final model (best weights)...')
+    best_ckpt = torch.load(os.path.join(args.save_dir, 'best.pth'), map_location='cpu')
     fp = os.path.join(args.save_dir, 'final.pth')
-    torch.save({'model': model.state_dict(), 'best_ep': best_ep, 'best_f1': best_f1}, fp)
+    torch.save({'model': best_ckpt['model'], 'best_ep': best_ep, 'best_f1': best_f1}, fp)
     ep = os.path.join(args.save_dir, 'encoder.pkl')
     with open(ep, 'wb') as f: pickle.dump(encoder, f)
-    print(f'  Saved: {fp}'); print(f'  Encoder: {ep}')
+    print(f'  Saved: {fp} (best epoch {best_ep})'); print(f'  Encoder: {ep}')
 
     if run:
         art = wandb.Artifact('model-files', type='model')

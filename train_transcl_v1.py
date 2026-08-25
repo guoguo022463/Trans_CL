@@ -672,6 +672,8 @@ def main():
     p.add_argument('--supervised-epochs', type=int, default=20)
     p.add_argument('--supervised-lr', type=float, default=1e-4)
     p.add_argument('--focal-gamma', type=float, default=2.0)
+    p.add_argument('--alpha', default='1,5,8',
+                   help='FocalLoss 类别权重，逗号分隔(benign,suspicious,malicious)，如 1,5,8；留空则用反频率自动权重')
     p.add_argument('--patience', type=int, default=6)
     p.add_argument('--weight-decay', type=float, default=0.0)
     p.add_argument('--label-smoothing', type=float, default=0.0)
@@ -734,8 +736,14 @@ def main():
                    os.path.join(args.save_dir, 'contrastive.pth'))
 
     # 6. Phase 2: Supervised
-    cw = np.bincount(y_train, minlength=3).astype(float)
-    cw = np.maximum(cw, 1.0); w = cw.sum() / (cw * 3.0); w = np.minimum(w, 20.0)
+    if args.alpha:
+        parts = args.alpha.split(',')
+        if len(parts) != 3:
+            p.error(f'--alpha 需提供 3 个值(benign,suspicious,malicious)，当前: {args.alpha}')
+        w = [float(x) for x in parts]
+    else:
+        cw = np.bincount(y_train, minlength=3).astype(float)
+        cw = np.maximum(cw, 1.0); w = cw.sum() / (cw * 3.0); w = np.minimum(w, 20.0)
     alpha = torch.tensor(w, dtype=torch.float32).to(device)
     criterion = FocalLoss(alpha=alpha, gamma=args.focal_gamma)
     print(f'  FocalLoss alpha={alpha.cpu().numpy()}, gamma={args.focal_gamma}')

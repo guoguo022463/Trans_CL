@@ -101,11 +101,14 @@ class NTXent(nn.Module):
         self.criterion = nn.CrossEntropyLoss()
 
     def forward(self, z1, z2):
+        # L2 归一化投影向量，使相似度限定在 [-1, 1]，从根源避免 exp 溢出导致的 NaN
+        z1 = F.normalize(z1, p=2, dim=1)
+        z2 = F.normalize(z2, p=2, dim=1)
         batch_size = z1.size(0)
         z = torch.cat([z1, z2], dim=0)
         sim = torch.mm(z, z.t()) / self.temperature
         mask = torch.eye(2 * batch_size, device=sim.device).bool()
-        sim = sim.masked_fill(mask, -9e15)
+        sim = sim.masked_fill(mask, -1e9)
         labels = torch.arange(batch_size, device=sim.device)
         labels = torch.cat([labels + batch_size, labels], dim=0)
         return self.criterion(sim, labels)
@@ -136,8 +139,17 @@ class FocalLoss(nn.Module):
 def _read_table(path):
     """读取 parquet/csv 表格"""
     if str(path).endswith(('.parquet', '.pq')):
-        return pd.read_parquet(path)
-    return pd.read_csv(path, low_memory=False)
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path, low_memory=False)
+    # 物化 pyarrow-backed 列（如 ArrowStringArray）为 numpy 数组，
+    # 避免 train_test_split 等重排操作触发 pyarrow ChunkedArray.take 一次性大块分配导致 OOM
+    for col in df.columns:
+        arr = df[col].array
+        if 'Arrow' in type(arr).__name__ or hasattr(arr, '_pa_array'):
+            # 用 dtype='object' 的 Series 赋值，防止 pandas 自动推断回 pyarrow-backed str dtype
+            df[col] = pd.Series(arr.to_numpy(), dtype='object')
+    return df
 
 
 def _attach_label(df):
@@ -162,7 +174,6 @@ def load_train_valid(data_path, val_path=None, val_answer=None, split=0.15, seed
     - 验证集优先级:
       1) val_path + val_answer（外部验证，按 event_id 对齐）
       2) split（从训练集内部分层切出 split 比例做验证，默认 0.15 即 85/15）
-      3) split=0（100%/100%，train=valid 同一份，向后兼容）
     """
     print(f'[1/4] Loading training data: {data_path}')
     train_df = _attach_label(_read_table(data_path))
@@ -182,8 +193,10 @@ def load_train_valid(data_path, val_path=None, val_answer=None, split=0.15, seed
         train_df, valid_df = train_test_split(
             train_df, test_size=split, random_state=seed, stratify=train_df['label'])
     else:
-        print('  (100%/100%：train=valid 同一份，不划分)')
-        valid_df = train_df.copy().reset_index(drop=True)
+        raise ValueError(
+            '无效的数据划分：未提供外部验证(--val-path/--val-answer)，'
+            '且 --split 不在 (0, 1) 范围内。'
+            '请提供独立验证集，或使用内部划分比例（如 --split 0.15）。')
 
     print('\n  ====== Dataset Split ======')
     for name, d in [('Train', train_df), ('Valid', valid_df)]:
@@ -200,8 +213,8 @@ def load_train_valid(data_path, val_path=None, val_answer=None, split=0.15, seed
 # ============================================================
 
 class SOCFeatureEncoder:
-    NUM_FEATURES = 32
-    NUM_COLS = list(range(32))
+    NUM_FEATURES = 34
+    NUM_COLS = list(range(34))
     CAT_COLS = [5, 6, 7, 8]
 
     def __init__(self):
@@ -341,24 +354,42 @@ class SOCFeatureEncoder:
         v = self.tfidf.transform([m])
         return self.pca.transform(v.toarray())[0].tolist()
 
+    def _is_missing(self, val):
+        """判断字段值是否缺失（None 或 NaN）"""
+        if val is None:
+            return True
+        try:
+            return bool(pd.isna(val))
+        except (TypeError, ValueError):
+            return False
+
+    def _lookup(self, map_name, val):
+        """把字段值映射为 ID，正确处理 NaN/空值 -> __MISSING__（而非误判为 '__nan__' 或 '__UNK__'）"""
+        m = self.maps[map_name]
+        if self._is_missing(val):
+            key = '__MISSING__'
+        else:
+            s = str(val).strip()
+            key = s if s else '__MISSING__'
+        return m.get(key, m.get('__UNK__', 1))
+
     def transform(self, df):
         df = self._ensure_text(df)
         feats = []
         for _, row in df.iterrows():
             t = self._time(row.get('timestamp',0))
-            p = self.maps['pipeline'].get(str(row.get('pipeline','')).strip() or '__MISSING__',
-                                           self.maps['pipeline'].get('__UNK__',1))
-            u = self.maps['username'].get(str(row.get('username','')).strip() or '__MISSING__',
-                                           self.maps['username'].get('__UNK__',1))
-            sh = self.maps['src_host'].get(str(row.get('src_host','')).strip() or '__MISSING__',
-                                            self.maps['src_host'].get('__UNK__',1))
-            sip = self.maps['src_ip'].get(str(row.get('src_ip','')).strip() or '__MISSING__',
-                                           self.maps['src_ip'].get('__UNK__',1))
+            p = self._lookup('pipeline', row.get('pipeline'))
+            u = self._lookup('username', row.get('username'))
+            sh = self._lookup('src_host', row.get('src_host'))
+            sip = self._lookup('src_ip', row.get('src_ip'))
             priv, sub, loop = self._ip(row.get('src_ip',''))
             ml, miss, km, kb = self._msg(row)
             tf = self._tfidf(str(row.get('_text','')))
+            dh_miss = 1.0 if self._is_missing(row.get('dst_host')) else 0.0
+            uname_miss = 1.0 if self._is_missing(row.get('username')) else 0.0
             f = [t[0],t[1],t[2],t[3],t[4], float(p),float(u),float(sh),float(sip),
-                 priv, sub, loop, ml, miss, float(km), float(kb)] + tf
+                 priv, sub, loop, ml, miss, float(km), float(kb),
+                 dh_miss, uname_miss] + tf
             feats.append(f)
         return np.array(feats, dtype=np.float32)
 
@@ -390,8 +421,8 @@ class LogAugmenter:
     def __call__(self, x):
         x2 = x.clone()
         n = torch.zeros_like(x2)
-        for i in range(32):
-            if i < x2.shape[1]: n[:,i] = 1.0
+        for i in range(x2.shape[1]):
+            n[:, i] = 1.0
         x2 = x2 + torch.randn_like(x2) * self.noise * n
         m = torch.rand_like(x2) < self.mask
         return x2 * (~m).float()
@@ -490,16 +521,16 @@ def wandb_log_all(run, labels, preds, res, prefix="val", step=None):
 
 class TransCLContrastiveModel(nn.Module):
     def __init__(self, device, hidden_dim=256, num_classes=3, num_layers=4, nhead=4,
-                 dropout=0.1, temperature=0.5):
+                 dropout=0.1, temperature=0.5, num_features=None):
         super().__init__()
         self.device = device
+        self.num_features = num_features or SOCFeatureEncoder.NUM_FEATURES
         self.base = TransCL_SOCClassifier(
             device=device, hidden_dim=hidden_dim, num_classes=num_classes,
             num_layers=num_layers, nhead=nhead, dropout=dropout,
-            num_columns=SOCFeatureEncoder.NUM_FEATURES
+            num_columns=self.num_features
         )
-        # Transformer encoder 输出维度 = 32 * 16 = 512
-        encoder_output_dim = SOCFeatureEncoder.NUM_FEATURES * 16
+        encoder_output_dim = self.num_features * 16
         self.projection = OutputLayer(input_dim=encoder_output_dim, output_dim=128)
         self.ntxent = NTXent(temperature=temperature)
         self.to(device)
@@ -532,15 +563,38 @@ def train_contrastive(model, train_loader, device, epochs, lr, run=None):
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     for ep in range(1, epochs+1):
         model.train(); total_loss, n = 0.0, 0
+        epoch_snapshot = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        aborted = False
         for x, _ in train_loader:
             x = x.to(device)
             x_aug = aug(x)
             p1, p2 = model.forward_contrastive(x, x_aug)
             loss = model.ntxent(p1, p2)
-            opt.zero_grad(); loss.backward(); opt.step()
+            if not torch.isfinite(loss):
+                print(f'  [WARNING] Contrastive Ep {ep}: loss={loss.item()} non-finite, skip batch')
+                continue
+            opt.zero_grad(); loss.backward()
+            grads_ok = all(bool(torch.isfinite(p.grad).all())
+                           for p in model.parameters() if p.grad is not None)
+            if not grads_ok:
+                print(f'  [WARNING] Contrastive Ep {ep}: gradient non-finite, skip batch')
+                continue
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+            if not all(bool(torch.isfinite(p).all()) for p in model.parameters()):
+                print(f'  [ERROR] Contrastive Ep {ep}: weights became NaN/Inf, rollback & abort phase')
+                model.load_state_dict(epoch_snapshot)
+                aborted = True
+                break
             total_loss += loss.item(); n += 1
-        avg = total_loss / n if n else 0
+        if aborted:
+            print(f'  [ERROR] Contrastive phase aborted at Ep {ep} due to NaN/Inf weights')
+            break
+        avg = total_loss / n if n else float('nan')
         print(f'  Contrastive Ep {ep}/{epochs} | Loss={avg:.4f}')
+        if not torch.isfinite(torch.tensor(avg)):
+            print(f'  [WARNING] Contrastive Ep {ep}: all batches non-finite, weights may be NaN')
+            break
         if run: run.log({'contrastive/loss': avg, 'contrastive/epoch': ep}, step=ep)
 
 def train_supervised(model, train_loader, valid_loader, criterion, device, epochs, lr,
@@ -558,19 +612,40 @@ def train_supervised(model, train_loader, valid_loader, criterion, device, epoch
     no_improve = 0
     for ep in range(1, epochs+1):
         model.train(); tot, corr, total = 0.0, 0, 0
+        epoch_snapshot = {k: v.detach().clone() for k, v in model.state_dict().items()}
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             logits = model(x)
             loss = criterion(logits, y)
-            opt.zero_grad(); loss.backward(); opt.step()
+            if not torch.isfinite(loss):
+                print(f'  [WARNING] Supervised Ep {ep}: loss={loss.item()} non-finite, skip batch')
+                continue
+            opt.zero_grad(); loss.backward()
+            grads_ok = all(bool(torch.isfinite(p.grad).all())
+                           for p in model.parameters() if p.grad is not None)
+            if not grads_ok:
+                print(f'  [WARNING] Supervised Ep {ep}: gradient non-finite, skip batch')
+                continue
+            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()),
+                                           max_norm=1.0)
+            opt.step()
+            if not all(bool(torch.isfinite(p).all()) for p in model.parameters()):
+                print(f'  [ERROR] Supervised Ep {ep}: weights became NaN/Inf, rollback & abort')
+                model.load_state_dict(epoch_snapshot)
+                total = -1
+                break
             tot += loss.item()
             corr += (logits.argmax(1) == y).sum().item(); total += len(y)
+        if total <= 0:
+            print(f'  [ERROR] Supervised Ep {ep}: no valid batches (total={total}), abort training')
+            break
         acc = corr / total
         print(f'  Supervised Ep {ep}/{epochs} | Loss={tot/len(train_loader):.4f} Acc={acc:.4f}')
         if run: run.log({'supervised/train_loss': tot/len(train_loader), 'supervised/train_acc': acc}, step=step_offset+ep)
         if ep % eval_every == 0 or ep == epochs:
             res = evaluate_model(model, valid_loader, device, 'validation', run, step_offset+ep)
-            val_f1 = res['Weighted']['F1']
+            # 选优/早停改用 Macro F1：对三个类别一视同仁，避免被多数类(benign)掩盖
+            val_f1 = res['Macro']['F1']
             save_metrics_row(os.path.join(save_dir, 'metrics.csv'), ep,
                              tot/len(train_loader), acc, res)
             if val_f1 > best_f1:
@@ -582,14 +657,14 @@ def train_supervised(model, train_loader, valid_loader, criterion, device, epoch
                 model.to(device)
                 save_confusion_matrix(res['cm'], os.path.join(save_dir, 'cm_best.png'),
                                       f'Confusion Matrix (Epoch {ep})')
-                print(f'  [BEST] Saved (Weighted F1={best_f1:.4f})')
+                print(f'  [BEST] Saved (Macro F1={best_f1:.4f})')
             else:
                 no_improve += 1
                 print(f'  [INFO] No improve ({no_improve}/{patience})')
                 if no_improve >= patience:
                     print(f'  [EARLY STOP] No improvement for {patience} epochs. Best: Ep {best_ep}')
                     break
-    print(f'\nPhase 2 done. Best Val F1: {best_f1:.4f} (Epoch {best_ep})')
+    print(f'\nPhase 2 done. Best Val Macro F1: {best_f1:.4f} (Epoch {best_ep})')
     return best_f1, best_ep, best_res
 
 def evaluate_model(model, loader, device, prefix='val', run=None, step=None):
@@ -684,16 +759,16 @@ def main():
     p.add_argument('--val-path', default=None, help='验证输入 parquet/csv（无标签，需配合 --val-answer）')
     p.add_argument('--val-answer', default=None, help='验证标签 parquet/csv（event_id + label_binary）')
     p.add_argument('--split', type=float, default=0.15,
-                   help='从训练集内部分层切出的验证比例(0~1)，默认 0.15(85/15)；0 则不划分；传 --val-path/--val-answer 时外部验证优先')
+                   help='从训练集内部分层切出的验证比例(0~1)，默认 0.15(85/15)；传 --val-path/--val-answer 时外部验证优先')
     p.add_argument('--batch-size', type=int, default=256)
     p.add_argument('--hidden-dim', type=int, default=256)
     p.add_argument('--num-layers', type=int, default=4)
     p.add_argument('--nhead', type=int, default=4)
     p.add_argument('--dropout', type=float, default=0.1)
     p.add_argument('--contrastive-epochs', type=int, default=10)
-    p.add_argument('--contrastive-lr', type=float, default=1e-4)
-    p.add_argument('--temperature', type=float, default=0.5)
-    p.add_argument('--supervised-epochs', type=int, default=20)
+    p.add_argument('--contrastive-lr', type=float, default=3e-5)
+    p.add_argument('--temperature', type=float, default=1.0)
+    p.add_argument('--supervised-epochs', type=int, default=5)
     p.add_argument('--supervised-lr', type=float, default=1e-4)
     p.add_argument('--focal-gamma', type=float, default=2.0)
     p.add_argument('--alpha', default='1,5,8',
@@ -707,7 +782,10 @@ def main():
     p.add_argument('--run-name', default=None,
                    help='实验名，默认自动生成 MMDD_XX（日期+当天次数）')
     p.add_argument('--wandb-tags', default='')
-    p.add_argument('--wandb-offline', action='store_true')
+    p.add_argument('--wandb-offline', action='store_true',
+                   help='离线模式（默认即离线，此参数为兼容保留）')
+    p.add_argument('--wandb-online', action='store_true',
+                   help='在线模式，同步到 wandb 云端（需网络稳定）')
     p.add_argument('--wandb-disabled', action='store_true')
     p.add_argument('--eval-every', type=int, default=1)
     p.add_argument('--save-dir', default='models/transcl_v1')
@@ -718,7 +796,7 @@ def main():
     run_name = args.run_name or auto_run_name(args.save_dir)
     args.save_dir = os.path.join(args.save_dir, run_name)
 
-    mode = 'disabled' if args.wandb_disabled else ('offline' if args.wandb_offline else 'online')
+    mode = 'disabled' if args.wandb_disabled else ('online' if args.wandb_online else 'offline')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device} | W&B mode: {mode} | Run: {run_name}')
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -726,7 +804,7 @@ def main():
     run = None
     if WANDB_AVAILABLE and not args.wandb_disabled:
         tags = [t.strip() for t in args.wandb_tags.split(',') if t.strip()]
-        tags.extend(['contrastive', 'parquet', '3class', '32d'])
+        tags.extend(['contrastive', 'parquet', '3class', '34d'])
         run = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
                          name=args.wandb_run_name or run_name,
                          tags=tags, mode=mode, config=vars(args))
@@ -801,14 +879,14 @@ def main():
 
     print(); print('='*70)
     print('Training Complete!')
-    print(f'  Best Val Weighted F1: {best_f1:.4f} (Epoch {best_ep})')
+    print(f'  Best Val Macro F1: {best_f1:.4f} (Epoch {best_ep})')
 
     # 8. 保存训练报告
     report = {
         'run_name': run_name,
         'save_dir': args.save_dir,
         'best_epoch': best_ep,
-        'best_val_weighted_f1': best_f1,
+        'best_val_macro_f1': best_f1,
         'data': {
             'train': args.data_path,
             'val': args.val_path,

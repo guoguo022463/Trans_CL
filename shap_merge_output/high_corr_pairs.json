@@ -1,0 +1,22 @@
+[
+  [
+    "dst_host_missing",
+    "username_missing",
+    0.999850003749053
+  ],
+  [
+    "pipeline_idx",
+    "msg_is_missing",
+    0.9791549111774348
+  ],
+  [
+    "msg_length",
+    "kw_benign_count",
+    0.8769557561029715
+  ],
+  [
+    "time_hour_norm",
+    "time_sin",
+    0.8731335144926244
+  ]
+]

@@ -22,13 +22,14 @@ warnings.filterwarnings('ignore')
 
 
 def get_feature_names():
-    """32维特征名称，与 SOCFeatureEncoder 输出顺序一致"""
+    """34维特征名称，与 SOCFeatureEncoder 输出顺序一致（v1 当前工作区版本）"""
     time_feats = ['time_hour_norm', 'time_sin', 'time_cos', 'time_is_weekend', 'time_is_night']
     cat_feats = ['pipeline_idx', 'username_idx', 'src_host_idx', 'src_ip_idx']
     ip_feats = ['ip_is_private', 'ip_subnet_hash', 'ip_is_loopback']
     msg_feats = ['msg_length', 'msg_is_missing', 'kw_malicious_count', 'kw_benign_count']
+    miss_feats = ['dst_host_missing', 'username_missing']
     tfidf_feats = [f'tfidf_pca_{i}' for i in range(16)]
-    return time_feats + cat_feats + ip_feats + msg_feats + tfidf_feats
+    return time_feats + cat_feats + ip_feats + msg_feats + miss_feats + tfidf_feats
 
 
 def prepare_text_column(df):
@@ -69,6 +70,12 @@ def main():
         df = pd.read_parquet(args.data_path)
     else:
         df = pd.read_csv(args.data_path, low_memory=False)
+
+    # 物化 pyarrow-backed 列，避免 df.sample() 触发 ChunkedArray.take 一次性大块分配 OOM
+    for col in df.columns:
+        arr = df[col].array
+        if 'Arrow' in type(arr).__name__ or hasattr(arr, '_pa_array'):
+            df[col] = pd.Series(arr.to_numpy(), dtype='object')
 
     # 关键修复: 设置 _text 列，否则 TF-IDF + 消息特征全为0
     df = prepare_text_column(df)
